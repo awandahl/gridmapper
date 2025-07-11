@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<!--
+grids.html -- OpenStreetMap/Leaflet version with band/mode filter checkboxes and grid hover callsign popup.
+-->
+<html>
+<head>
+    <title>Worked Grids by Band and Mode</title>
+    <meta name="viewport" content="width=device-width, initial-scale=0.75">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            border: 0;
+            font-family: sans-serif;
+        }
+        .header {
+            height: 4vh;
+            font-size: 3vh;
+            text-align: center;
+        }
+        #band-filters, #mode-filters {
+            text-align: center;
+            margin: 1em;
+        }
+        #map {
+            width: 100vw;
+            height: 90vh;
+            margin: auto;
+        }
+        .footerLeft {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            height: 2vh;
+            font-size: 2vh;
+        }
+        .footerMid {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            text-align: center;
+            height: 2vh;
+            font-size: 2vh;
+        }
+        .footerRight {
+            position: absolute;
+            right: 0;
+            bottom: 0;
+            text-align: right;
+            height: 2vh;
+            font-size: 2vh;
+        }
+        .leaflet-label {
+            font-weight: bold;
+            color: #000;
+            background: rgba(255,255,255,0.7);
+            border-radius: 2px;
+            padding: 1px 4px;
+            font-size: 12px;
+            border: 1px solid #ccc;
+            display: inline-block;
+            white-space: nowrap;
+            min-width: 0;
+            box-sizing: border-box;
+            text-align: center;
+            pointer-events: auto;
+        }
+    </style>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+</head>
+<body>
+    <div id="header" class="header">
+        SM0HPL Grids Worked by Band and Mode
+    </div>
+    <div id="band-filters"></div>
+    <div id="mode-filters"></div>
+    <div id="map"></div>
+    <div id="footerLeft" class="footerLeft"></div>
+    <div id="footerMid" class="footerMid">
+        <a href="https://github.com/n1kdo/lotw-gridmapper">GitHub</a>
+    </div>
+    <div id="footerRight" class="footerRight">
+        <a href="https://www.n1kdo.com">N1KDO</a> 20170812
+    </div>
+    <script>
+        let allQsos = [];
+        let map = null;
+        let gridLayers = {};
+        let gridToCallsigns = {};
+
+        // Internal band names for logic (must match ADIF, so lowercase)
+        const allBands = [
+            "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m",
+            "6m", "4m", "2m", "1.25m", "70cm", "33cm", "23cm"
+        ];
+        // Display labels (with capital M)
+        const allBandsDisplay = allBands.map(band => band.replace('cm', 'CM').replace('m', 'M'));
+
+        // Internal mode names for logic (must match ADIF, so uppercase)
+        const allModes = ["FT4", "FT8", "SSB", "CW", "FM", "AM", "RTTY"];
+
+        function gridToCoordinates(gridSquare) {
+            gridSquare = gridSquare.toLowerCase();
+            const a = "a".charCodeAt(0);
+            const zero = "0".charCodeAt(0);
+            let lon = (gridSquare.charCodeAt(0) - a) * 20.0;
+            let lat = (gridSquare.charCodeAt(1) - a) * 10.0;
+            lon += (gridSquare.charCodeAt(2) - zero) * 2.0;
+            lat += (gridSquare.charCodeAt(3) - zero);
+            lon = lon - 180;
+            lat = lat - 90;
+            return {lat: lat, lng: lon};
+        }
+
+        function addSquare(map, gridSquare, callsigns) {
+            let coords = gridToCoordinates(gridSquare);
+            let lat = coords['lat'];
+            let lon = coords['lng'];
+            let bounds = [
+                [lat, lon],
+                [lat + 1, lon + 2]
+            ];
+
+            // Draw rectangle for grid square
+            let rect = L.rectangle(bounds, {
+                color: "#ff0000",
+                weight: 1,
+                fillColor: "#ff0000",
+                fillOpacity: 0.25
+            }).addTo(map);
+
+            // Place label at the true center of the grid
+            let labelLat = lat + 0.5;
+            let labelLon = lon + 1;
+            let marker = L.marker([labelLat, labelLon], {
+                icon: L.divIcon({
+                    className: 'leaflet-label',
+                    html: gridSquare.toUpperCase(),
+                    iconSize: [40, 20],      // Fixed size
+                    iconAnchor: [20, 10]     // Center of label
+                }),
+                interactive: true
+            }).addTo(map);
+
+            // Tooltip content
+            let tooltipContent = `<b>${gridSquare.toUpperCase()}</b><br>Stations:<br>${callsigns.length > 0 ? callsigns.join('<br>') : 'None'}`;
+
+            // Attach tooltip to both rectangle and label marker
+            rect.bindTooltip(tooltipContent, {sticky: true, direction: "top"});
+            marker.bindTooltip(tooltipContent, {sticky: true, direction: "top"});
+
+            return [rect, marker];
+        }
+
+        function drawMap() {
+            if (map !== null) {
+                map.remove();
+            }
+            map = L.map('map').setView([54.5, 15.5], 4);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 18,
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+            gridLayers = {};
+        }
+
+        function parse_adif_line(line) {
+            // Parse all <field:value> pairs in the line
+            let fields = {};
+            let regex = /<([^:>]+)(?::\d+)?>((?:.|\n)*?)(?=<|$)/g;
+            let match;
+            while ((match = regex.exec(line)) !== null) {
+                fields[match[1].toLowerCase()] = match[2].trim();
+            }
+            // For mode and submode, always store as uppercase for logic
+            if (fields['mode']) fields['mode'] = fields['mode'].toUpperCase().trim();
+            if (fields['submode']) fields['submode'] = fields['submode'].toUpperCase().trim();
+            if (fields['call']) fields['call'] = fields['call'].toUpperCase().trim();
+            return fields;
+        }
+
+        function processAdiLines(text) {
+            let lines = text.split("\n");
+            allQsos = [];
+            gridToCallsigns = {};
+            let bandsFound = new Set();
+            let modesFound = new Set();
+            for (let i = 0; i < lines.length; i++) {
+                let line = lines[i].trim();
+                if (line.length === 0) continue;
+                let qso = parse_adif_line(line);
+                if (qso['band']) bandsFound.add(qso['band'].toLowerCase());
+                // Add FT4 as a mode if submode is FT4
+                if (qso['submode'] && qso['submode'] === 'FT4') {
+                    modesFound.add('FT4');
+                } else if (qso['mode']) {
+                    modesFound.add(qso['mode'].toUpperCase());
+                }
+                // Build grid-to-callsigns mapping
+                if (qso['gridsquare'] && qso['gridsquare'].length >= 4 && qso['call']) {
+                    let grid = qso['gridsquare'].toUpperCase().substr(0, 4);
+                    let call = qso['call'].toUpperCase();
+                    if (!gridToCallsigns[grid]) gridToCallsigns[grid] = new Set();
+                    gridToCallsigns[grid].add(call);
+                }
+                allQsos.push(qso);
+            }
+            generateBandCheckboxes(bandsFound);
+            generateModeCheckboxes(modesFound);
+            updateMap();
+        }
+
+        function generateBandCheckboxes(bandsFound) {
+            const container = document.getElementById('band-filters');
+            container.innerHTML = '';
+            allBands.forEach((band, i) => {
+                let checked = (band === '6m') ? 'checked' : '';
+                container.innerHTML += `<label><input type="checkbox" class="band-checkbox" value="${band}" ${checked}>${allBandsDisplay[i]}</label> `;
+            });
+            Array.from(document.querySelectorAll('.band-checkbox')).forEach(cb => {
+                cb.addEventListener('change', updateMap);
+            });
+        }
+
+        function generateModeCheckboxes(modesFound) {
+            const container = document.getElementById('mode-filters');
+            container.innerHTML = '';
+            allModes.forEach(mode => {
+                let checked = (mode === 'FT8') ? 'checked' : '';
+                container.innerHTML += `<label><input type="checkbox" class="mode-checkbox" value="${mode}" ${checked}>${mode}</label> `;
+            });
+            Array.from(document.querySelectorAll('.mode-checkbox')).forEach(cb => {
+                cb.addEventListener('change', updateMap);
+            });
+        }
+
+        function getSelectedBands() {
+            return Array.from(document.querySelectorAll('.band-checkbox:checked')).map(cb => cb.value);
+        }
+        function getSelectedModes() {
+            return Array.from(document.querySelectorAll('.mode-checkbox:checked')).map(cb => cb.value.toUpperCase());
+        }
+
+        function qsoMatchesSelectedModes(qso, selectedModes) {
+            // FT4: mode must be MFSK and submode FT4
+            if (selectedModes.includes('FT4')) {
+                if (qso['mode'] === 'MFSK' && qso['submode'] === 'FT4') return true;
+            }
+            // FT8: mode must be FT8 (no submode)
+            if (selectedModes.includes('FT8')) {
+                if (qso['mode'] === 'FT8') return true;
+            }
+            // Other modes: match by mode only, ignore submode
+            for (let mode of selectedModes) {
+                if (mode !== 'FT8' && mode !== 'FT4' && qso['mode'] === mode) return true;
+            }
+            return false;
+        }
+
+        function updateMap() {
+            drawMap();
+            let selectedBands = getSelectedBands();
+            let selectedModes = getSelectedModes();
+            let grids = new Set();
+            let gridToFilteredCallsigns = {};
+            for (let qso of allQsos) {
+                if (
+                    qso['band'] &&
+                    selectedBands.includes(qso['band'].toLowerCase()) &&
+                    qsoMatchesSelectedModes(qso, selectedModes) &&
+                    qso['gridsquare'] && qso['gridsquare'].length >= 4 &&
+                    qso['call']
+                ) {
+                    let grid = qso['gridsquare'].toUpperCase().substr(0, 4);
+                    let call = qso['call'].toUpperCase();
+                    grids.add(grid);
+                    if (!gridToFilteredCallsigns[grid]) gridToFilteredCallsigns[grid] = new Set();
+                    gridToFilteredCallsigns[grid].add(call);
+                }
+            }
+            for (let grid of grids) {
+                let callsigns = gridToFilteredCallsigns[grid] ? Array.from(gridToFilteredCallsigns[grid]).sort() : [];
+                addSquare(map, grid, callsigns);
+            }
+            // Display selected bands and modes in header
+            let selectedBandLabels = selectedBands.map(band => {
+                let idx = allBands.indexOf(band);
+                return idx !== -1 ? allBandsDisplay[idx] : band;
+            });
+            document.getElementById("header").innerHTML = "SM0HPL Grids Worked: " + selectedBandLabels.join(", ") + " / " + selectedModes.join(", ");
+            document.getElementById("footerLeft").innerHTML = grids.size + " Worked Grid Squares";
+        }
+
+        // On page load, automatically load the ADI file and display the map
+        window.onload = function() {
+            // Initial load
+            fetch('wsjtx_log.adi?nocache=' + new Date().getTime())
+                .then(response => response.text())
+                .then(function(text) {
+                    processAdiLines(text);
+                });
+
+            // Reload the ADI file every 60 seconds
+            setInterval(function() {
+                fetch('wsjtx_log.adi?nocache=' + new Date().getTime())
+                    .then(response => response.text())
+                    .then(function(text) {
+                        processAdiLines(text);
+                    });
+            }, 60000); // 60000 ms = 60 seconds
+        };
+    </script>
+</body>
+</html>
